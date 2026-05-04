@@ -18,18 +18,23 @@ struct DesignListResponse: Decodable {
     let items: [CanvaDesign]
     let continuation: String?
 }
-
 struct ExportStartResponse: Decodable {
     let job: JobStart
-
     struct JobStart: Decodable {
         let id: String?
         let status: String
     }
 }
-
 struct ExportStatusResponse: Decodable {
     let job: JobDetail
+
+    struct JobDetail: Decodable {
+        let id: String?
+        let status: String
+        let urls: [String]?
+    }
+}
+
 
     struct JobDetail: Decodable {
         let id: String?
@@ -40,7 +45,6 @@ struct ExportStatusResponse: Decodable {
             let download_url: String?
         }
     }
-}
 
 struct TokenResponse: Decodable {
     let access_token: String
