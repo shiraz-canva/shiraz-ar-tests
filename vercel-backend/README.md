@@ -23,8 +23,8 @@ In the Vercel dashboard → your project → Settings → Environment Variables,
 
 | Variable | Value |
 |---|---|
-| `CANVA_CLIENT_ID` | `OC-AZ3dLDxy5UuA` |
-| `CANVA_CLIENT_SECRET` | `cnvca2ku480AGmUinJVN81hEWHY3XmaX2EweoSvLeJ7QBjq44690aec1` |
+| `CANVA_CLIENT_ID` | your client ID from the Canva developer portal |
+| `CANVA_CLIENT_SECRET` | your client secret from the Canva developer portal |
 | `CANVA_REDIRECT_URI` | `https://canva-ar-auth.vercel.app/callback` |
 
 Then redeploy: `vercel --prod`
