@@ -16,7 +16,7 @@ class CanvaAPIService: NSObject, ObservableObject {
     private let redirectURI = "https://canva-ar-auth.vercel.app/callback"
     private let baseURL     = "https://api.canva.com/rest/v1"
     private let authURL     = "https://www.canva.com/api/oauth/authorize"
-    private let scopes      = "design:meta:read design:content:read asset:read"
+    private let scopes      = "design:meta:read design:content:read"
 
     // ── State ──────────────────────────────────────────────────────────────────
     @Published var isAuthenticated = false
@@ -31,21 +31,20 @@ class CanvaAPIService: NSObject, ObservableObject {
             let verifier  = generateCodeVerifier()
             let challenge = generateCodeChallenge(from: verifier)
 
-            // Pass verifier directly as state so Vercel can use it for token exchange.
-            // verifier is already base64url (A-Z a-z 0-9 - _) — safe as a URL query value.
-            let encodedScope     = scopes.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? scopes
-            let encodedRedirect  = redirectURI.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? redirectURI
-            let encodedChallenge = challenge.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? challenge
-
-            let urlString = "\(authURL)?response_type=code"
-                + "&client_id=\(clientID)"
-                + "&redirect_uri=\(encodedRedirect)"
-                + "&scope=\(encodedScope)"
-                + "&code_challenge=\(encodedChallenge)"
-                + "&code_challenge_method=s256"
-                + "&state=\(verifier)"   // verifier IS the state — Vercel reads it back directly
-
-            guard let authorizationURL = URL(string: urlString) else { throw APIError.authFailed }
+            // Use URLComponents so query values (especially redirect_uri) are
+            // percent-encoded correctly — manual encoding with .urlQueryAllowed
+            // leaves ':' and '/' unencoded inside values, which causes invalid_request.
+            var components = URLComponents(string: authURL)!
+            components.queryItems = [
+                URLQueryItem(name: "response_type",         value: "code"),
+                URLQueryItem(name: "client_id",             value: clientID),
+                URLQueryItem(name: "redirect_uri",          value: redirectURI),
+                URLQueryItem(name: "scope",                 value: scopes),
+                URLQueryItem(name: "code_challenge",        value: challenge),
+                URLQueryItem(name: "code_challenge_method", value: "S256"),
+                URLQueryItem(name: "state",                 value: verifier),
+            ]
+            guard let authorizationURL = components.url else { throw APIError.authFailed }
 
             let token = try await presentAuthSession(url: authorizationURL)
             self.accessToken     = token
@@ -69,7 +68,8 @@ class CanvaAPIService: NSObject, ObservableObject {
                     cont.resume(throwing: APIError.authFailed); return
                 }
                 if let err = items.first(where: { $0.name == "error" })?.value {
-                    cont.resume(throwing: APIError.authError(err)); return
+                    let desc = items.first(where: { $0.name == "error_description" })?.value ?? ""
+                    cont.resume(throwing: APIError.authError(desc.isEmpty ? err : "\(err): \(desc)")); return
                 }
                 guard let token = items.first(where: { $0.name == "access_token" })?.value else {
                     cont.resume(throwing: APIError.authFailed); return
@@ -92,36 +92,48 @@ class CanvaAPIService: NSObject, ObservableObject {
     // MARK: - Export
 
     /// Exports a design as a PNG and returns the download URL.
-    /// Uses async polling (max 20 attempts, 1 s apart).
+    /// Uses async polling (max 30 attempts, 1 s apart).
     func exportDesign(id: String) async throws -> URL {
-        struct ExportRequest: Encodable {
+        // Canva Connect API: POST /v1/exports with design_id in the body
+        struct ExportBody: Encodable {
             struct Format: Encodable { let type: String }
             let design_id: String
             let format: Format
         }
-        let body = try JSONEncoder().encode(ExportRequest(design_id: id, format: .init(type: "png")))
+        let body = try JSONEncoder().encode(ExportBody(design_id: id, format: .init(type: "png")))
         let startData = try await post(path: "/exports", body: body)
-        print("EXPORT RESPONSE: \(String(data: startData, encoding: .utf8) ?? "nil")")
+
+        if let raw = String(data: startData, encoding: .utf8) {
+            print("📦 Export start response: \(raw)")
+        }
+
         let startResp = try JSONDecoder().decode(ExportStartResponse.self, from: startData)
-        guard let jobID = startResp.job.id else { throw APIError.exportFailed }
+        guard let jobID = startResp.job.id else { throw APIError.exportDetail("Job started but no job ID returned") }
         return try await pollExport(jobID: jobID)
     }
 
     private func pollExport(jobID: String, attempt: Int = 0) async throws -> URL {
-        guard attempt < 20 else { throw APIError.exportTimeout }
+        guard attempt < 30 else { throw APIError.exportTimeout }
+
         let data = try await get(path: "/exports/\(jobID)")
-        print("POLL RESPONSE: \(String(data: data, encoding: .utf8) ?? "nil")")
+
+        if let raw = String(data: data, encoding: .utf8) {
+            print("🔄 Export poll [\(attempt)]: \(raw)")
+        }
+
         let status = try JSONDecoder().decode(ExportStatusResponse.self, from: data)
 
         switch status.job.status {
         case "success":
-            guard
-                let urlStr = status.job.urls?.first,
-                let url    = URL(string: urlStr)
-            else { throw APIError.exportFailed }
+            guard let urlStr = status.job.urls?.first else {
+                throw APIError.exportDetail("Job succeeded but urls array is empty")
+            }
+            guard let url = URL(string: urlStr) else {
+                throw APIError.exportDetail("Invalid download URL: \(urlStr)")
+            }
             return url
         case "failed":
-            throw APIError.exportFailed
+            throw APIError.exportDetail("Canva export job status: failed")
         default:
             try await Task.sleep(nanoseconds: 1_000_000_000)
             return try await pollExport(jobID: jobID, attempt: attempt + 1)
@@ -134,7 +146,12 @@ class CanvaAPIService: NSObject, ObservableObject {
         guard let token = accessToken else { throw APIError.notAuthenticated }
         var req = URLRequest(url: URL(string: baseURL + path)!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let raw = String(data: data, encoding: .utf8),
+           let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            print("❌ GET \(path) → \(http.statusCode): \(raw)")
+            throw APIError.exportFailed
+        }
         return data
     }
 
@@ -145,7 +162,16 @@ class CanvaAPIService: NSObject, ObservableObject {
         req.setValue("Bearer \(token)",  forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        let (data, _) = try await URLSession.shared.data(for: req)
+        if let sent = String(data: body, encoding: .utf8) {
+            print("📤 POST \(path) body: \(sent)")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let raw  = String(data: data, encoding: .utf8) ?? ""
+        print("📥 POST \(path) → \(code): \(raw)")
+        if code >= 400 {
+            throw APIError.exportDetail("POST \(path) → HTTP \(code): \(raw)")
+        }
         return data
     }
 
@@ -164,15 +190,16 @@ class CanvaAPIService: NSObject, ObservableObject {
     // MARK: - Errors
 
     enum APIError: LocalizedError {
-        case authFailed, authError(String), notAuthenticated, exportFailed, exportTimeout
+        case authFailed, authError(String), notAuthenticated, exportFailed, exportDetail(String), exportTimeout
 
         var errorDescription: String? {
             switch self {
-            case .authFailed:         return "Authentication failed."
-            case .authError(let msg): return "Auth error: \(msg)"
-            case .notAuthenticated:   return "Not signed in."
-            case .exportFailed:       return "Design export failed."
-            case .exportTimeout:      return "Export timed out — try again."
+            case .authFailed:            return "Authentication failed."
+            case .authError(let msg):    return "Auth error: \(msg)"
+            case .notAuthenticated:      return "Not signed in."
+            case .exportFailed:          return "Design export failed."
+            case .exportDetail(let msg): return "Export: \(msg)"
+            case .exportTimeout:         return "Export timed out — try again."
             }
         }
     }
