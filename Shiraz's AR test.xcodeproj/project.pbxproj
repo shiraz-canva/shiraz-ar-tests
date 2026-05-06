@@ -10,22 +10,9 @@
 		68D79BB32FA3379B00F1B55B /* Shiraz's AR test.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Shiraz's AR test.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		68D79BD32FA8420500F1B55B /* Exceptions for "Shiraz's AR test" folder in "Shiraz's AR test" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				"Shiraz-s-AR-test-Info.plist",
-			);
-			target = 68D79BB22FA3379B00F1B55B /* Shiraz's AR test */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		68D79BB52FA3379B00F1B55B /* Shiraz's AR test */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				68D79BD32FA8420500F1B55B /* Exceptions for "Shiraz's AR test" folder in "Shiraz's AR test" target */,
-			);
 			path = "Shiraz's AR test";
 			sourceTree = "<group>";
 		};

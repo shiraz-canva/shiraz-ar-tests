@@ -69,18 +69,32 @@ struct ContentView: View {
     @State private var isExporting = false
     @State private var selectedDesign: CanvaDesign?
     @State private var useFrontCamera = false
+    @State private var hasPlacedDesign = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            // ── AR view (full screen) ─────────────────────────────────────────
+            // ── AR view (full screen) + scan coaching overlay ────────────────
             ARViewContainer(
                 selectedImageURL: $selectedImageURL,
                 placementMode: $placementMode,
                 selectedFormat: $selectedFormat,
                 statusMessage: $statusMessage,
-                useFrontCamera: $useFrontCamera
+                useFrontCamera: $useFrontCamera,
+                hasPlacedDesign: $hasPlacedDesign
             )
             .ignoresSafeArea()
+
+            // ── Scan coaching overlay ─────────────────────────────────────────
+            // Split into two direct ZStack children (same pattern as the working Color.red test):
+            // 1) the full-screen scrim, 2) the centred grid + text on top.
+            if selectedImageURL != nil && !hasPlacedDesign && placementMode != .tshirt {
+                Color.black.opacity(0.58)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+
+                scanCoachingContent
+                    .allowsHitTesting(false)
+            }
 
             // ── Status pill (top) ─────────────────────────────────────────────
             VStack {
@@ -90,9 +104,17 @@ struct ContentView: View {
                 Spacer()
             }
 
-            // ── Bottom panel ──────────────────────────────────────────────────
-            bottomPanel
+            // ── Bottom panel ─────────────────────────────────────────────────
+            // Hidden while scanning (design loaded but not yet placed) so the
+            // ripple overlay gets the full screen. Shows before picking (so the
+            // user can tap "Pick a Design") and after placement (to switch formats).
+            if selectedImageURL == nil || hasPlacedDesign {
+                bottomPanel
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: hasPlacedDesign)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: selectedImageURL == nil)
         .sheet(isPresented: $showDesignPicker) {
             DesignPickerView { design in
                 showDesignPicker = false
@@ -281,6 +303,7 @@ struct ContentView: View {
                     selectedImageURL = nil
                     selectedDesign   = nil
                     useFrontCamera   = false
+                    hasPlacedDesign  = false
                     statusMessage    = placementMode.placementHint
                 } label: {
                     Image(systemName: "xmark")
@@ -358,6 +381,7 @@ struct ContentView: View {
 
     private func exportDesign(_ design: CanvaDesign) {
         isExporting = true
+        hasPlacedDesign = false         // reset so coaching overlay shows for this new design
         statusMessage = "Exporting \(design.title ?? "design")…"
         Task {
             do {
@@ -368,6 +392,92 @@ struct ContentView: View {
                 statusMessage = "Export failed: \(error.localizedDescription)"
             }
             isExporting = false
+        }
+    }
+
+    // MARK: - Scan coaching content — full-screen ripple mesh
+
+    private var scanCoachingContent: some View {
+        let purple    = Color(hex: "#8B3DFF")
+        let purpleDim = Color(hex: "#6B21D4")
+
+        return ZStack {
+            // ── Full-screen ripple grid ───────────────────────────────
+            TimelineView(.animation) { tl in
+                Canvas { ctx, size in
+                    let t  = tl.date.timeIntervalSinceReferenceDate
+                    let cx = size.width  / 2
+                    let cy = size.height / 2
+                    let cols = 18; let rows = 30
+                    let cW = size.width  / CGFloat(cols)
+                    let cH = size.height / CGFloat(rows)
+
+                    // Displaced vertex — radial sine ripples from centre
+                    func pt(_ col: Int, _ row: Int) -> CGPoint {
+                        let bx = cW * CGFloat(col)
+                        let by = cH * CGFloat(row)
+                        let dx = bx - cx; let dy = by - cy
+                        let dist = sqrt(dx * dx + dy * dy)
+                        let falloff = max(0.05, 1.0 - dist / max(cx, cy))
+                        let w1 = sin(dist * 0.028 - t * 2.6) * 7.0
+                        let w2 = sin(dist * 0.055 - t * 1.7 + 1.1) * 3.5
+                        return CGPoint(x: bx, y: by + (w1 + w2) * falloff)
+                    }
+
+                    func brightness(_ col: Int, _ row: Int) -> Double {
+                        let bx = cW * CGFloat(col); let by = cH * CGFloat(row)
+                        let dist = sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy))
+                        return 0.22 + 0.20 * Double((sin(dist * 0.028 - t * 2.6) + 1) / 2)
+                    }
+
+                    // Horizontal mesh lines
+                    for row in 0...rows {
+                        var path = Path()
+                        path.move(to: pt(0, row))
+                        for col in 1...cols { path.addLine(to: pt(col, row)) }
+                        ctx.stroke(path, with: .color(purple.opacity(brightness(cols / 2, row))),
+                                   lineWidth: 0.9)
+                    }
+                    // Vertical mesh lines
+                    for col in 0...cols {
+                        var path = Path()
+                        path.move(to: pt(col, 0))
+                        for row in 1...rows { path.addLine(to: pt(col, row)) }
+                        ctx.stroke(path, with: .color(purpleDim.opacity(0.18)), lineWidth: 0.5)
+                    }
+                    // Glowing dots at wave peaks
+                    for row in 0...rows { for col in 0...cols {
+                        let bx = cW * CGFloat(col); let by = cH * CGFloat(row)
+                        let dist = sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy))
+                        let w = sin(dist * 0.028 - t * 2.6)
+                        guard w > 0.55 else { continue }
+                        let p = pt(col, row)
+                        let r = CGFloat(2.5 * (w - 0.55) / 0.45)
+                        ctx.fill(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r,
+                                                         width: r * 2, height: r * 2)),
+                                 with: .color(purple.opacity(0.85)))
+                    }}
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // ── Label pinned to bottom ────────────────────────────────
+            VStack {
+                Spacer()
+                VStack(spacing: 8) {
+                    Text(placementMode.prefersWall ? "Point at a wall" : "Scanning for surface…")
+                        .font(Easel.body(18, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text(placementMode.prefersWall
+                         ? "Hold steady and pan slowly across a wall"
+                         : "Hold steady — your design will appear automatically")
+                        .font(Easel.body(13))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 48)
+                }
+                .padding(.bottom, 180)
+            }
         }
     }
 }

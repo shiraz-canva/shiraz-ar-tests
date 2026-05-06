@@ -73,18 +73,21 @@ struct ARViewContainer: UIViewRepresentable {
     @Binding var selectedFormat: PrintFormat
     @Binding var statusMessage: String
     @Binding var useFrontCamera: Bool
+    @Binding var hasPlacedDesign: Bool
 
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
         context.coordinator.arView = arView
         arView.session.delegate = context.coordinator
 
+        // ARCoachingOverlayView replaced by custom ARScanCoachingView (SwiftUI).
+        // Keep a hidden instance so ARKit still gets session delegate coaching calls,
+        // but never make it visible — our SwiftUI overlay handles the UI.
         let coaching = ARCoachingOverlayView()
-        coaching.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        coaching.session  = arView.session
-        coaching.goal     = .horizontalPlane
-        coaching.isHidden = true   // shown only after user picks a design
-        coaching.activatesAutomatically = false  // we control timing explicitly
+        coaching.session              = arView.session
+        coaching.goal                 = .horizontalPlane
+        coaching.isHidden             = true
+        coaching.activatesAutomatically = false
         arView.addSubview(coaching)
         context.coordinator.coachingOverlay = coaching
 
@@ -93,6 +96,21 @@ struct ARViewContainer: UIViewRepresentable {
             action: #selector(Coordinator.handleTap(_:))
         )
         arView.addGestureRecognizer(tap)
+
+        let pan = UIPanGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handlePan(_:))
+        )
+        pan.delegate = context.coordinator
+        arView.addGestureRecognizer(pan)
+
+        let rotate = UIRotationGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleRotation(_:))
+        )
+        rotate.delegate = context.coordinator
+        arView.addGestureRecognizer(rotate)
+
         context.coordinator.startWorldTracking()
         return arView
     }
@@ -110,6 +128,12 @@ struct ARViewContainer: UIViewRepresentable {
             coord.cachedImage    = nil
             coord.cachedImageURL = nil
             coord.cachedTexture  = nil
+            if selectedImageURL == nil {
+                // Design cleared — reset reposition state so pan/rotate don't fire on stale anchor
+                coord.lastPlacedAnchor    = nil
+                coord.lastPlacedTransform = nil
+                coord.accumulatedRotationY = 0
+            }
         }
         coord.pendingImageURL = selectedImageURL
         coord.placementMode   = placementMode
@@ -140,16 +164,18 @@ struct ARViewContainer: UIViewRepresentable {
             }
         }
 
-        // Show scan coaching only when user has a design to place but hasn't tapped yet
-        coord.updateCoachingVisibility(hasDesign: selectedImageURL != nil)
+        // Keep system coaching overlay permanently hidden (custom SwiftUI overlay handles this)
+        coord.coachingOverlay?.isHidden = true
+        coord.coachingOverlay?.setActive(false, animated: false)
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(statusMessage: $statusMessage) }
+    func makeCoordinator() -> Coordinator { Coordinator(statusMessage: $statusMessage,
+                                                        hasPlacedDesign: $hasPlacedDesign) }
 
     // MARK: - Coordinator
 
     @MainActor
-    class Coordinator: NSObject, ARSessionDelegate {
+    class Coordinator: NSObject, ARSessionDelegate, UIGestureRecognizerDelegate {
         var arView: ARView?
         var pendingImageURL: URL?
         var placementMode: PlacementMode = .flat
@@ -170,12 +196,20 @@ struct ARViewContainer: UIViewRepresentable {
         var cachedTexture: TextureResource?
         var isBuilding = false
 
+        // Reposition / rotate state
+        var lastPlacedAnchor: AnchorEntity?
+        var accumulatedRotationY: Float = 0
+
         // Vision (auto-detection, secondary to tap)
         let visionQueue = DispatchQueue(label: "canvaar.vision", qos: .userInitiated)
         var frameCounter = 0
 
         @Binding var statusMessage: String
-        init(statusMessage: Binding<String>) { _statusMessage = statusMessage }
+        @Binding var hasPlacedDesign: Bool
+        init(statusMessage: Binding<String>, hasPlacedDesign: Binding<Bool>) {
+            _statusMessage   = statusMessage
+            _hasPlacedDesign = hasPlacedDesign
+        }
 
         // MARK: - Session configuration
 
@@ -186,7 +220,7 @@ struct ARViewContainer: UIViewRepresentable {
             config.environmentTexturing = .automatic
             arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
             applyCoachingGoal()
-            // Coaching overlay visibility is managed by updateCoachingVisibility — don't force-show here
+            // Coaching overlay visibility is computed in ContentView from hasPlacedDesign — don't force-show here
             updateStatus(pendingImageURL != nil ? placementMode.placementHint : "Pick a design to start")
         }
 
@@ -244,13 +278,12 @@ struct ARViewContainer: UIViewRepresentable {
             }
         }
 
-        /// Shows the ARKit coaching overlay only when the user has a design ready to place
-        /// but hasn't tapped a surface yet. Uses both isHidden and setActive so ARKit
-        /// cannot override our intent (setActive alone can be overridden by the system).
-        func updateCoachingVisibility(hasDesign: Bool) {
-            let needsScan = hasDesign && lastPlacedTransform == nil && placementMode != .tshirt
-            coachingOverlay?.isHidden = !needsScan
-            coachingOverlay?.setActive(needsScan, animated: true)
+        /// Keeps the system ARCoachingOverlayView permanently hidden (we use SwiftUI overlay)
+        /// and updates the ARCoachingOverlayView goal to match the current placement mode.
+        func updateCoachingGoalAndOverlay() {
+            coachingOverlay?.isHidden = true
+            coachingOverlay?.setActive(false, animated: false)
+            applyCoachingGoal()
         }
 
         // MARK: - ARSessionDelegate: per-frame updates
@@ -276,8 +309,9 @@ struct ARViewContainer: UIViewRepresentable {
             let camTransform = frame.camera.transform
             let vs           = CGSize(width: UIScreen.main.bounds.width,
                                      height: UIScreen.main.bounds.height)
+            let pixelBufferCopy = pixelBuffer  // local binding; visionQueue only reads, never mutates
             visionQueue.async { [weak self] in
-                self?.visionDetectAndPlace(pixelBuffer: pixelBuffer,
+                self?.visionDetectAndPlace(pixelBuffer: pixelBufferCopy,
                                            cameraTransform: camTransform,
                                            viewSize: vs)
             }
@@ -306,7 +340,37 @@ struct ARViewContainer: UIViewRepresentable {
                           bodyAnchorEntity == nil else { return }
                     Task { await self.buildFaceChestDesign(from: face) }
                 }
+
+                // Auto-place: when a plane is first detected and a design is waiting, place immediately
+                if anchor is ARPlaneAnchor,
+                   placementMode != .tshirt,
+                   pendingImageURL != nil,
+                   lastPlacedTransform == nil,
+                   !isBuilding {
+                    Task { await self.autoPlaceOnDetectedSurface() }
+                }
             }
+        }
+
+        /// Raycasts from screen centre and places the design as soon as a surface is confirmed.
+        @MainActor
+        func autoPlaceOnDetectedSurface() async {
+            guard let arView = arView,
+                  pendingImageURL != nil,
+                  lastPlacedTransform == nil,
+                  !isBuilding else { return }
+
+            let centre = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+            let alignment: ARRaycastQuery.TargetAlignment = placementMode.prefersWall ? .vertical : .horizontal
+
+            guard let query = arView.makeRaycastQuery(from: centre,
+                                                      allowing: .estimatedPlane,
+                                                      alignment: alignment),
+                  let result = arView.session.raycast(query).first else {
+                // Plane added but phone not aimed at it yet — retry in didUpdate
+                return
+            }
+            await placeDesign(at: result.worldTransform, in: arView)
         }
 
         func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
@@ -316,6 +380,15 @@ struct ARViewContainer: UIViewRepresentable {
                           bodyAnchorEntity == nil,
                           pendingImageURL != nil else { return }
                     Task { await self.buildFaceChestDesign(from: face) }
+                }
+
+                // Retry auto-place on each plane update until successful
+                if anchor is ARPlaneAnchor,
+                   placementMode != .tshirt,
+                   pendingImageURL != nil,
+                   lastPlacedTransform == nil,
+                   !isBuilding {
+                    Task { await self.autoPlaceOnDetectedSurface() }
                 }
             }
         }
@@ -435,6 +508,73 @@ struct ARViewContainer: UIViewRepresentable {
             }
             Task { await placeDesign(at: hit.worldTransform, in: arView) }
         }
+
+        // MARK: - Pan gesture (drag to reposition)
+
+        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+            guard let arView = arView,
+                  lastPlacedTransform != nil,
+                  placementMode != .tshirt,
+                  let anchor = lastPlacedAnchor else { return }
+
+            let pt = gesture.location(in: arView)
+
+            if placementMode.prefersWall {
+                // ── Wall modes (frame, canvas) ────────────────────────────────
+                // Strictly vertical raycast — no fallback so the design never
+                // flies off the wall onto the floor.
+                let results = arView.raycast(from: pt, allowing: .estimatedPlane, alignment: .vertical)
+                guard let hit = results.first else { return }
+                // Preserve wall-hit rotation (encodes the wall normal direction)
+                var t = anchor.transform
+                t.translation = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                                              hit.worldTransform.columns.3.y,
+                                              hit.worldTransform.columns.3.z)
+                anchor.move(to: t, relativeTo: nil, duration: 0.05, timingFunction: .linear)
+                lastPlacedTransform = hit.worldTransform
+
+            } else {
+                // ── Floor modes (flat, mug, phone case, yard sign, banner, billboard) ──
+                // Strictly horizontal — no .any fallback so banners/billboards
+                // can't be lifted off the floor by pointing the finger at a wall.
+                let results = arView.raycast(from: pt, allowing: .estimatedPlane, alignment: .horizontal)
+                guard let hit = results.first else { return }
+                // Rebuild rotation from accumulatedRotationY only — never inherit
+                // the ARKit hit-transform rotation, which varies per point and causes
+                // apparent spinning. Pan and rotation gestures now share the same
+                // rotation source so they don't fight each other.
+                var t = Transform()
+                t.translation = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                                              hit.worldTransform.columns.3.y,
+                                              hit.worldTransform.columns.3.z)
+                t.rotation = simd_quatf(angle: accumulatedRotationY, axis: [0, 1, 0])
+                anchor.move(to: t, relativeTo: nil, duration: 0.05, timingFunction: .linear)
+                lastPlacedTransform = hit.worldTransform
+            }
+        }
+
+        // MARK: - Rotation gesture (two-finger spin, floor modes only)
+
+        @objc func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+            guard placementMode != .tshirt,
+                  !placementMode.prefersWall,
+                  let anchor = lastPlacedAnchor else { return }
+
+            guard gesture.state == .changed else { return }
+
+            // gesture.rotation accumulates since .began — reset to zero each .changed
+            // so we always get the incremental delta rather than total rotation.
+            accumulatedRotationY -= Float(gesture.rotation)
+            gesture.rotation = 0
+
+            anchor.orientation = simd_quatf(angle: accumulatedRotationY, axis: [0, 1, 0])
+        }
+
+        // Allow pan and rotate to fire at the same time (two-finger drag-rotate)
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool { true }
 
         // MARK: - World-point helper (ray cast, fallback to camera forward)
 
@@ -674,7 +814,17 @@ struct ARViewContainer: UIViewRepresentable {
 
                 try placeWithCurrentFormat(texture: texture, image: uiImage,
                                            at: transform, in: arView)
-                updateStatus("Tap again to reposition")
+                // Capture the anchor for pan/rotate gestures and reset user rotation.
+                lastPlacedAnchor    = arView.scene.anchors.first as? AnchorEntity
+                accumulatedRotationY = 0
+                // Design is now in the scene — dismiss the overlay so it fades out
+                // while the design is already visible (cross-dissolve feel).
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    hasPlacedDesign = true
+                }
+                updateStatus(placementMode.prefersWall
+                             ? "Drag to move on the wall"
+                             : "Drag · two fingers to rotate")
             } catch {
                 updateStatus("Error: \(error.localizedDescription)")
             }
@@ -693,6 +843,7 @@ struct ARViewContainer: UIViewRepresentable {
             do {
                 try placeWithCurrentFormat(texture: texture, image: image,
                                            at: transform, in: arView)
+                lastPlacedAnchor = arView.scene.anchors.first as? AnchorEntity
                 updateStatus("\(selectedFormat.name) — \(selectedFormat.displayDimensions)")
             } catch {
                 updateStatus("Resize failed: \(error.localizedDescription)")
@@ -1066,5 +1217,6 @@ struct ARViewContainer: UIViewRepresentable {
         private func updateStatus(_ msg: String) {
             DispatchQueue.main.async { self.statusMessage = msg }
         }
+
     }
 }
